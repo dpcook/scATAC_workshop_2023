@@ -32,7 +32,7 @@ download.file(url = "https://cf.10xgenomics.com/samples/cell-atac/1.0.1/atac_v1_
 
 # Cell metadata from cellranger
 download.file(url = "https://cf.10xgenomics.com/samples/cell-atac/1.0.1/atac_v1_pbmc_10k/atac_v1_pbmc_10k_singlecell.csv",
-              destfile = "atac_v1_pbmc_10k_singlecell.csv")
+              destfile = "../data/atac_v1_pbmc_10k_singlecell.csv")
 
 # File providing coordinates and ranges of each ATAC fragment in the library
 download.file(url = "https://cf.10xgenomics.com/samples/cell-atac/1.0.1/atac_v1_pbmc_10k/atac_v1_pbmc_10k_fragments.tsv.gz",
@@ -45,6 +45,8 @@ download.file(url = "https://cf.10xgenomics.com/samples/cell-atac/1.0.1/atac_v1_
 # scRNA-seq of PBMCs in case you want to try integrating/comparing
 download.file(url = "https://cf.10xgenomics.com/samples/cell/pbmc3k/pbmc3k_filtered_gene_bc_matrices.tar.gz",
               destfile = "../data/pbmc3k_filtered_gene_bc_matrices.tar.gz")
+untar("../data/pbmc3k_filtered_gene_bc_matrices.tar.gz",
+      exdir = "../data")
 ```
 
 ## Load files
@@ -372,9 +374,25 @@ seurat_obj
 
 This `chromvar` assay contains a motif-by-cell matrix corresponding the relative activity level of the TF inferred by the algorithm
 
+Right now the transcription factor IDs being used are the JASPAR IDs, which can be hard to navigate. Remember that the TF gene name is provided as metadata in the object
+
+```{r}
+tf_metadata <- data.frame(
+  jaspar_id = names(seurat_obj[["peaks"]]@motifs@motif.names),
+  gene_id = as.character(seurat_obj[["peaks"]]@motifs@motif.names)
+)
+```
+
+```{r}
+tf_metadata
+```
+
+
+
+
 ```{r}
 DefaultAssay(seurat_obj) <- 'chromvar'
-FeaturePlot(seurat_obj, features="MA0769.2", min.cutoff=0) #TCF7
+FeaturePlot(seurat_obj, features="MA0107.1", min.cutoff=0) #RELA
 ```
 
 
@@ -382,6 +400,7 @@ FeaturePlot(seurat_obj, features="MA0769.2", min.cutoff=0) #TCF7
 We can take those differentially accessible regions for cluster 1 and look for over-representation of TF motifs
 
 ```{r}
+DefaultAssay(seurat_obj) <- "peaks" #the motifs data is attached to the ATAC assay (peaks)
 enriched.motifs <- FindMotifs(
   object = seurat_obj,
   features = cluster1_markers$region
@@ -404,3 +423,102 @@ MotifPlot(
 ```
 
 Note Left1 and Hnf1a similarity
+
+# Save Point
+```{r}
+saveRDS(seurat_obj, file="../data/pbmc_atac_processed.rds")
+```
+
+# Optional: Integrate with scRNA-seq
+## Load and process RNA
+```{r}
+rna_counts <- Read10X("../data/filtered_gene_bc_matrices/hg19")
+rna_obj <- CreateSeuratObject(counts = rna_counts,
+                              min.cells=3,
+                              min.features=10)
+rna_obj <- NormalizeData(rna_obj) %>%
+  FindVariableFeatures() %>%
+  ScaleData() %>%
+  RunPCA(verbose=F) %>%
+  RunUMAP(dims=1:25) %>%
+  FindNeighbors(dims=1:25) %>%
+  FindClusters(resolution=0.6)
+```
+
+```{r}
+DimPlot(rna_obj, label=T) + NoLegend()
+```
+
+## Integrate
+Here, we'll use Seurat's CCA integration method to integrate the scRNA-seq data with the "Gene Activities" matrix from the scATAC data.
+
+You can do this to actually merge the objects together, but there's usually no reason to do this. Often, we're interested in something more practical, like project cell type labels from the RNA-seq onto the ATAC data, which is usually harder to annoate
+```{r}
+rna_obj$assay <- "RNA"
+seurat_obj$assay <- "ATAC"
+DefaultAssay(seurat_obj) <- "RNA" #the Gene Activities assay
+
+transfer.anchors <- FindTransferAnchors(
+  reference = rna_obj,
+  query = seurat_obj,
+  reduction = 'cca'
+)
+
+predicted.labels <- TransferData(
+  anchorset = transfer.anchors,
+  refdata = rna_obj$seurat_clusters,
+  weight.reduction = seurat_obj[['lsi']],
+  dims = 2:30 # remember that component 1 = technical--correlated with total peak counts
+)
+
+seurat_obj$predicted_cluster <- predicted.labels$predicted.id
+```
+
+```{r}
+p1 <- DimPlot(rna_obj, group.by="seurat_clusters", label=T) +
+  ggtitle("RNA w/ RNA labels")
+p2 <- DimPlot(seurat_obj, group.by="predicted_cluster", label=T) +
+  ggtitle("ATAC w/ RNA labels")
+p3 <- DimPlot(seurat_obj, group.by="seurat_clusters", label=T) +
+  ggtitle("ATAC w/ ATAC labels")
+cowplot::plot_grid(p1, p2,p3, ncol=2)
+```
+
+Interesting that we seem to be resolving some T cell populations in the ATAC data that aren't particularly clear in the RNA data. Note that the RNA data only has the one cluster 4 population that maps to two different clusters in the ATAC data (clusters 2 and 5). [Note: depending on our installation environments, our embeddings and clustering may differ slightly, so do not be concerned if our cluster numbers are different]
+
+Let's see if we can find regulatory regions associated with these clusters
+
+We could do differential peak accessibility to look for specific regions, or for a rough prediction of differential expression, we can to typical DGE on that Gene Activity matrix
+```{r}
+DefaultAssay(seurat_obj) <- "RNA"
+cluster2_markers <- FindMarkers(
+  seurat_obj,
+  ident.1=2,
+  only.pos=T,
+  logfc.threshold = 1)
+cluster2_markers
+```
+
+
+This would be differential accessibility of the ATAC signal
+```{r}
+DefaultAssay(seurat_obj) <- "peaks"
+cluster2_markers <- FindMarkers(
+  seurat_obj,
+  ident.1=2,
+  test.use = 'LR', #logistic regression
+  latent.vars = 'nCount_peaks', #model effects of total counts so it doesn't confound results
+  only.pos = T, #only positive peaks
+  logfc.threshold = 2 #increase log fold change threshold just to speed up computation for workshop
+)
+
+cluster2_markers$region <- rownames(cluster2_markers)
+cluster2_features <- ClosestFeature(seurat_obj, regions = cluster2_markers$region)
+
+cluster2_markers <- left_join(cluster2_markers, cluster1_features,
+                              by=c("region"="query_region"))
+```
+
+
+
+
