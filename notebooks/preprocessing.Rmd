@@ -4,18 +4,18 @@ output: html_notebook
 ---
 # Load dependencies
 ```{r}
-library(Seurat)
-library(Signac)
-library(EnsDb.Hsapiens.v75) #genome database
-library(tidyverse)
-library(chromVAR)
-library(JASPAR2022)
-library(TFBSTools)
-library(ggseqlogo)
-library(BSgenome.Hsapiens.UCSC.hg19)
+library(Seurat) #CRAN
+library(Signac) #CRAN
+library(EnsDb.Hsapiens.v75) #Bioconductor
+library(BSgenome.Hsapiens.UCSC.hg19) #Bioconductor
+library(tidyverse) #CRAN
+library(chromVAR) #Bioconductor
+library(JASPAR2022) #Bioconductor
+library(TFBSTools) #Bioconductor
+library(ggseqlogo) #CRAN 
 
-#install.packages('ggseqlogo')
-#BiocManager::install('biovizBase')
+#Installing CRAN packages: install.packages('ggseqlogo')
+#Installing Bioconductor packages: BiocManager::install('biovizBase')
 ```
 
 # Load data
