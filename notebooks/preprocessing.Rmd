@@ -1,0 +1,406 @@
+---
+title: "Stem Cell Network - scATAC-seq workshop"
+output: html_notebook
+---
+# Load dependencies
+```{r}
+library(Seurat)
+library(Signac)
+library(EnsDb.Hsapiens.v75) #genome database
+library(tidyverse)
+library(chromVAR)
+library(JASPAR2022)
+library(TFBSTools)
+library(ggseqlogo)
+library(BSgenome.Hsapiens.UCSC.hg19)
+
+#install.packages('ggseqlogo')
+#BiocManager::install('biovizBase')
+```
+
+# Load data
+Similar to scRNA-seq data, we are going to load ATAC-seq data into a Seurat object. Here, we will get more familiar with the idea of "assays" within the object.
+
+## Download if you haven't
+
+If you have not downloaded the data for the workshop, you can download it into the project folder with the following (make sure this notebook is saved in the `notebooks/` subdirectory:
+
+```{r}
+# Peak-by-cell counts matrix
+download.file(url = "https://cf.10xgenomics.com/samples/cell-atac/1.0.1/atac_v1_pbmc_10k/atac_v1_pbmc_10k_filtered_peak_bc_matrix.h5",
+              destfile = "../data/atac_v1_pbmc_10k_filtered_peak_bc_matrix.h5")
+
+# Cell metadata from cellranger
+download.file(url = "https://cf.10xgenomics.com/samples/cell-atac/1.0.1/atac_v1_pbmc_10k/atac_v1_pbmc_10k_singlecell.csv",
+              destfile = "atac_v1_pbmc_10k_singlecell.csv")
+
+# File providing coordinates and ranges of each ATAC fragment in the library
+download.file(url = "https://cf.10xgenomics.com/samples/cell-atac/1.0.1/atac_v1_pbmc_10k/atac_v1_pbmc_10k_fragments.tsv.gz",
+              destfile = "../data/atac_v1_pbmc_10k_fragments.tsv.gz")
+
+# Index file for the fragments
+download.file(url = "https://cf.10xgenomics.com/samples/cell-atac/1.0.1/atac_v1_pbmc_10k/atac_v1_pbmc_10k_fragments.tsv.gz.tbi",
+              destfile = "../data/atac_v1_pbmc_10k_fragments.tsv.gz.tbi")
+
+# scRNA-seq of PBMCs in case you want to try integrating/comparing
+download.file(url = "https://cf.10xgenomics.com/samples/cell/pbmc3k/pbmc3k_filtered_gene_bc_matrices.tar.gz",
+              destfile = "../data/pbmc3k_filtered_gene_bc_matrices.tar.gz")
+```
+
+## Load files
+
+```{r}
+counts <- Read10X_h5("../data/atac_v1_pbmc_10k_filtered_peak_bc_matrix.h5")
+
+metadata <- read.csv("../data/atac_v1_pbmc_10k_singlecell.csv",
+                     header = TRUE, row.names = 1)
+```
+
+The `counts` variable is a region-by-cell count matrix. Each row represents a called peak.
+
+```{r}
+counts[1:3,1:3]
+```
+
+The `metadata` variable is returned by cellranger and provides QC information about each cell in the `counts` matrix. 
+```{r}
+colnames(metadata)
+```
+
+
+We next move the `counts` matrix into an "assay" that will be held within the seurat object. Similar to an RNA assay in a seurat object, a ChromatinAssay can contain both raw and normalized counts. It can also contain information about each of the peaks in the matrix, including motif presence, closest gene, etc
+
+```{r}
+chrom_assay <- CreateChromatinAssay(
+  counts = counts,
+  sep = c(":", "-"),
+  fragments = '../data/atac_v1_pbmc_10k_fragments.tsv.gz',
+  min.cells = 10,
+  min.features = 200
+)
+```
+
+Store the assay and cell metadata in a Seurat object
+
+```{r}
+seurat_obj <- CreateSeuratObject(
+  counts = chrom_assay,
+  assay = "peaks",
+  meta.data = metadata
+)
+```
+
+Currently, the seurat object has genomic coordinates for peaks, but it doesn't know which build of the genome these coordinates correspond to.
+
+```{r}
+# extract gene annotations from EnsDb
+annotations <- GetGRangesFromEnsDb(ensdb = EnsDb.Hsapiens.v75)
+
+# These annotations are based on the Ensembl build, but this data was mapped to
+# a build with a slightly different format that encodes chromosomes as "chr1" vs. "1")
+# We'll just add "chr" to the chromosome value for the annotations
+seqlevels(annotations) <- paste0('chr', seqlevels(annotations))
+genome(annotations) <- "hg19"
+
+# Add this annotation to the seurat object
+Annotation(seurat_obj) <- annotations
+```
+
+Now our seurat object has information about what specific genome was used for the alignment. This will be beneficial for any analysis that involves the positioning of genes relative to those coordinates.
+
+```{r}
+seurat_obj
+```
+
+# Quality control
+
+There are a handful of QC metrics we can evaluate: 
+- total number of fragments in peaks: a measure of cell complexity
+- percentage of fragments that map to peaks vs. background regions (pct_reads_in_peaks)
+- nucleosome signal: ratio of nucleosome fragments (147-294bp) to nucleosome-free fragments
+- TSS enrichment: the extent to which fragments are more prevalent at the transcription start site of genes relative to flanking regions several kb away
+
+
+```{r}
+# compute nucleosome signal score per cell
+seurat_obj <- NucleosomeSignal(seurat_obj)
+
+# compute TSS enrichment score per cell
+seurat_obj <- TSSEnrichment(seurat_obj, fast = FALSE)
+
+# add blacklist ratio and fraction of reads in peaks
+seurat_obj$pct_reads_in_peaks <- seurat_obj$peak_region_fragments / seurat_obj$passed_filters * 100
+seurat_obj$blacklist_ratio <- seurat_obj$blacklist_region_fragments / seurat_obj$peak_region_fragments
+```
+
+```{r}
+DensityScatter(seurat_obj, x = 'nCount_peaks', y = 'pct_reads_in_peaks', 
+               log_x = T, quantiles = TRUE)
+```
+
+```{r}
+seurat_obj$high.tss <- ifelse(seurat_obj$TSS.enrichment > 3, 'High', 'Low')
+TSSPlot(seurat_obj, group.by = 'high.tss') + NoLegend()
+```
+
+And we can do a histogram of any of the QC metrics
+```{r}
+hist(seurat_obj$nucleosome_signal, breaks=100)
+```
+
+```{r}
+seurat_obj <- subset(
+  seurat_obj,
+  subset = nCount_peaks > 3000 &
+    nCount_peaks < 50000 &
+    pct_reads_in_peaks > 30 &
+    blacklist_ratio < 0.05 &
+    nucleosome_signal < 4 &
+    TSS.enrichment > 3
+)
+seurat_obj
+```
+
+# Preprocessing
+## Normalization and dimensionality reduction
+The nature of counts in an ATAC peak-by-cell matrix is very different from scRNA-seq: 
+- Each cell only has a limited number of copies of a genomic region that can be cut (2 for a diploid cell), so the range of values is much less complex. 
+- The number of features is often vastly larger than gene expression too (ie. up to 300k peaks vs. 20k transcripts). 
+
+Here, we perform two steps to normalize and embed the data. Together these steps are referred to as "Latent semantic indexing (LSI)": 
+1) Normalization (TF-IDF; term frequency-inverse document frequency)
+- Term frequency = Weight all sites for a cell by the total number of sites for that cell
+- Inverse document frequency = Inverse frequency of the site across all cells
+
+log(TF * IDF)
+
+The IDF component will upweight peaks that aren't super frequent across all cells, but are present in a cell of interest
+
+2) SVD (singular value decomposition) - a matrix factorization approach (similar to PCA)
+
+```{r}
+seurat_obj <- RunTFIDF(seurat_obj)
+seurat_obj <- FindTopFeatures(seurat_obj, min.cutoff = 'q10') #only run top 90% most common peaks
+seurat_obj <- RunSVD(seurat_obj)
+```
+
+Similar to PCA, the resulting components from SVD can capture technical features. With scATAC data, it is very common for the first component to simply reflect differences in peak count (or sequencing depth)
+
+```{r}
+DepthCor(seurat_obj)
+```
+
+So we can remove component 1 from downstream analysis
+
+# Non-linear dimensionality reduction and clustering
+Identical methods to scRNA-seq analysis. We'll use UMAP to produce a two dimensional embedding, and will use graph-based clustering approaches to cluster the SVD embedding.
+
+```{r}
+#Note that we omit the 1st component when we set 2:30. We also specify the LSI reduction (embedding)
+seurat_obj <- RunUMAP(seurat_obj, reduction = 'lsi', dims = 2:30)
+seurat_obj <- FindNeighbors(seurat_obj, reduction = 'lsi', dims = 2:30)
+seurat_obj <- FindClusters(seurat_obj, resolution=0.2)
+```
+
+We can now visualize a UMAP embedding of our data
+
+```{r}
+DimPlot(seurat_obj, label = TRUE) + NoLegend()
+```
+
+Looks great--we can clearly see that there are several distinct populations
+
+But what do they correspond to? We can't simply look at gene expression to associate clusters with sepcific expression patterns
+
+# Data exploration
+We can use features of the ATAC profile to infer expression patterns based on the assumption that expressed genes have increased accessibility at regulatory elements.
+
+First, we'll look at a common ATAC-seq trace, creating `pseudobulk` profiles for each cluster (ie. summing up the peak counts for all cells)
+
+```{r}
+CoveragePlot(seurat_obj,
+             group.by="seurat_clusters",
+             region = "CD3E",
+             extend.upstream = 10000, extend.downstream = 10000)
+```
+
+Note the directionality/strand of the gene. Clusters 1, 2, and 5 seem to have accessible promoters of CD3E, suggesting they may be T cells
+
+```{r}
+CoveragePlot(seurat_obj,
+             group.by="seurat_clusters",
+             region = "CD14",
+             extend.upstream = 10000, extend.downstream = 10000)
+```
+
+
+Clusters 6, 7, and 0 see to have accessible promoters around CD14. Perhaps these reflect myeloid lineages.
+
+## Calculate "gene activity"
+Another approach to infer expression is based on summing the ATAC counts for any region spanning the coding region for a gene +/- some window. Again, this is based on the association between expression and accessible chromatin. This is generically referred to as a "Gene activity matrix"
+
+```{r}
+gene.activities <- GeneActivity(seurat_obj)
+#Default is 2kb upstream and 0bp downstream
+```
+
+As this is essentially mimicking scRNA-seq data, we can create an RNA assay of this matrix and add it to our seurat object
+
+```{r}
+# add the gene activity matrix to the Seurat object as a new assay and normalize it
+seurat_obj[['RNA']] <- CreateAssayObject(counts = gene.activities)
+seurat_obj <- NormalizeData(
+  object = seurat_obj,
+  assay = 'RNA',
+  normalization.method = 'LogNormalize',
+  scale.factor = median(seurat_obj$nCount_RNA)
+)
+```
+
+```{r}
+seurat_obj
+```
+
+We can now switch around between our available assays (peaks and RNA)
+```{r}
+DefaultAssay(seurat_obj) <- "RNA"
+```
+
+And now can use functions as if this were a scRNA-seq dataset
+```{r}
+FeaturePlot(seurat_obj, features=c("CD3E", "MS4A1", "CD14"), order=T)
+```
+
+Note that the signal of this is never as clean as actual RNA expression would be. This matrix can also be used as a strategy to integrate your scATAC-seq data with scRNA-seq data
+
+# Differential accessibility
+We are often interested in knowing which peaks are specific to a given cell type.
+
+There are various approaches that can be taken for this, but a simple method is to just use a logistic regression to model accessibility in one cluster vs. the rest of the clusters (just as we did for scRNA-seq)
+
+So cluster 1 was one of the putative T cell clusters. Let see which regions are specific to it.
+
+```{r}
+DefaultAssay(seurat_obj) <- "peaks" #go back to the ATAC assay
+cluster1_markers <- FindMarkers(
+  object = seurat_obj,
+  ident.1 = 1,
+  test.use = 'LR', #logistic regression
+  latent.vars = 'nCount_peaks', #model effects of total counts so it doesn't confound results
+  only.pos = T, #only positive peaks
+  logfc.threshold = 2 #increase log fold change threshold just to speed up computation for workshop
+)
+```
+
+```{r}
+head(cluster1_markers)
+```
+
+Great! But we have no idea what these regions correspond to.
+
+We can look at them with one of those ATAC trace plots
+
+```{r}
+CoveragePlot(seurat_obj,
+             region = "chr14-99721608-99741934",
+             group.by='seurat_clusters',
+             extend.upstream = 5000, extend.downstream = 5000)
+```
+
+So it maps to a region in the first intron of the BCL11B gene.
+
+We can use this `ClosestFeature` function to tell us the closest gene to each region in our list
+```{r}
+cluster1_markers$region <- rownames(cluster1_markers)
+cluster1_features <- ClosestFeature(seurat_obj, regions = cluster1_markers$region)
+```
+
+And merge the tables together
+```{r}
+cluster1_markers <- left_join(cluster1_markers, cluster1_features,
+                              by=c("region"="query_region"))
+```
+
+
+```{r}
+head(cluster1_markers)
+```
+
+# Infer transcription factor activity
+Transcription factors bind DNA motifs within accessible regions of the genome. We can predict relative transcription factor activity by quantifying the accessibility of TF motifs across cells.
+
+We'll use a wrapper function in Seurat/Signac that implements the population [chromVAR method](https://www.nature.com/articles/nmeth.4401)
+
+```{r}
+# Get a list of motif position frequency matrices from the JASPAR database
+pfm <- getMatrixSet(
+  x = JASPAR2022,
+  opts = list(collection = "CORE", tax_group = 'vertebrates', all_versions = FALSE)
+)
+
+# Add motifs to the seurat object. 
+seurat_obj <- AddMotifs(
+  object = seurat_obj,
+  genome = BSgenome.Hsapiens.UCSC.hg19,
+  pfm = pfm
+)
+```
+
+The "motifs" section of our ChromatinAssay is now filled
+```{r}
+seurat_obj[['peaks']]@motifs
+# seurat_obj[['peaks']]@motifs@data = a region-by-motif presence matrix
+# seurat_obj[['peaks']]@motifs@pwm = position weight matrix for each motif
+# seurat_obj[['peaks']]@motifs@motif.names = matches JASPAR ID to TF gene symbol--we'll use this later
+# seurat_obj[['peaks']]@motifs@positions = a granges object for each motif providing locations for each motif
+```
+
+Now we can run chromVar which will compute the relative accessibility of motifs for each TF across all cells
+
+```{r}
+seurat_obj <- RunChromVAR(
+  object = seurat_obj,
+  genome = BSgenome.Hsapiens.UCSC.hg19
+)
+```
+
+ChromVAR will return yet another new assay in our seurat object
+
+```{r}
+seurat_obj
+```
+
+This `chromvar` assay contains a motif-by-cell matrix corresponding the relative activity level of the TF inferred by the algorithm
+
+```{r}
+DefaultAssay(seurat_obj) <- 'chromvar'
+FeaturePlot(seurat_obj, features="MA0769.2", min.cutoff=0) #TCF7
+```
+
+
+# Find over-represented motifs in a peak list
+We can take those differentially accessible regions for cluster 1 and look for over-representation of TF motifs
+
+```{r}
+enriched.motifs <- FindMotifs(
+  object = seurat_obj,
+  features = cluster1_markers$region
+)
+```
+
+```{r}
+head(enriched.motifs)
+```
+
+TCF7 is a known TF associated with T cell development.
+
+Note: Be careful interpreting results. Many TFs have similar motifs and can all be pulled up as hits in this type of analysis. You can look at the motif with the following function. You can also try to determine whether the TF is actually expressed in the cell (eg. with the gene activity matrix or from reference scRNA-seq)
+
+```{r}
+MotifPlot(
+  object = seurat_obj,
+  motifs = head(enriched.motifs$motif)
+)
+```
+
+Note Left1 and Hnf1a similarity
